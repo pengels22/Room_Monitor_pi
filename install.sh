@@ -159,8 +159,10 @@ prompt_secret () {
   if [[ -n "${hint}" ]]; then
     >&2 echo "  ${hint}"
   fi
+
   read -r -s -p "> " var
-  echo
+  >&2 echo   # <-- IMPORTANT: stderr, not stdout
+
   sanitize "${var}"
 }
 
