@@ -208,7 +208,8 @@ if [[ "${FULL_INSTALL}" == "y" ]]; then
     ca-certificates
 
   echo "==> Upgrading pip tooling"
-  pip3 install --upgrade --break-system-packages pip setuptools wheel
+  pip3 install --upgrade --break-system-packages pip setuptools || true
+
 
   if [[ -f "${REQ_FILE}" ]]; then
     echo "==> Installing Python requirements: ${REQ_FILE}"
