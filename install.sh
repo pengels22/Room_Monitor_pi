@@ -2,8 +2,15 @@
 set -euo pipefail
 
 # ============================================================
-# install.sh — interactive setup + deps + optional systemd
+# install.sh — Room Monitor installer (interactive)
 # Run: sudo ./install.sh
+#
+# What it does (Full install):
+#  - Installs OS deps (python3/pip/etc)
+#  - Installs pip deps from requirements.txt
+#  - Writes config to /etc/room_monitor/config.env (0600)
+#  - Installs script to /usr/local/bin/Room_Monitor.py
+#  - Optionally installs/enables systemd service: room_monitor.service
 # ============================================================
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -12,17 +19,17 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-PROJECT_NAME="shed_gpio_mqtt"
-SERVICE_NAME="shed_gpio_mqtt"
+PROJECT_NAME="room_monitor"
+SERVICE_NAME="room_monitor"
 
 CONF_DIR="/etc/${PROJECT_NAME}"
 CONF_FILE="${CONF_DIR}/config.env"
 
-LOG_DIR="/var/log/shed"
+LOG_DIR="/var/log/${PROJECT_NAME}"
 
 REQ_FILE="${REQ_FILE:-requirements.txt}"
-SCRIPT_SOURCE="${SCRIPT_SOURCE:-shed_gpio_mqtt.py}"   # repo filename
-INSTALL_PATH="/usr/local/bin/${SCRIPT_SOURCE}"        # installed filename
+SCRIPT_SOURCE="${SCRIPT_SOURCE:-Room_Monitor.py}"        # repo filename
+INSTALL_PATH="/usr/local/bin/${SCRIPT_SOURCE}"          # installed filename
 
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -31,20 +38,36 @@ DEFAULT_HA_PORT="8123"
 DEFAULT_DISCOVERY_PREFIX="homeassistant"
 
 # ------------------------
-# Helpers
+# Helpers (robust + clear)
 # ------------------------
 prompt_text () {
   local label="$1"
+  local example="${2:-}"
   local var=""
-  read -r -p "${label}: " var
+
+  if [[ -n "${example}" ]]; then
+    >&2 echo -e "\n${label}\n  Example: ${example}"
+  else
+    >&2 echo -e "\n${label}"
+  fi
+
+  read -r -p "> " var
   echo "${var}"
 }
 
 prompt_default () {
   local label="$1"
   local def="$2"
+  local example="${3:-}"
   local var=""
-  read -r -p "${label} [${def}]: " var
+
+  if [[ -n "${example}" ]]; then
+    >&2 echo -e "\n${label}\n  Default: ${def}\n  Example: ${example}"
+  else
+    >&2 echo -e "\n${label}\n  Default: ${def}"
+  fi
+
+  read -r -p "> " var
   if [[ -z "${var}" ]]; then
     echo "${def}"
   else
@@ -56,52 +79,56 @@ prompt_yes_no () {
   local label="$1"
   local def="$2" # y or n
   local var=""
+
   while true; do
-    read -r -p "${label} (y/n) [${def}]: " var
+    >&2 echo -e "\n${label}\n  Enter: y or n (default: ${def})"
+    read -r -p "> " var
     var="${var:-$def}"
     case "${var,,}" in
       y|yes) echo "y"; return 0 ;;
       n|no)  echo "n"; return 0 ;;
-      *) echo "Please answer y or n." ;;
+      *) >&2 echo "Please answer y or n." ;;
     esac
   done
 }
 
 prompt_choice () {
-  # prompt_choice "Title" "1" "Option 1" "2" "Option 2" ...
+  # Print menu to stderr, echo ONLY the selected value to stdout.
   local title="$1"
   shift
-  echo
-  echo "${title}"
+
+  >&2 echo
+  >&2 echo "${title}"
   while (( "$#" )); do
     local key="$1"; local text="$2"
-    echo "  ${key}) ${text}"
+    >&2 echo "  ${key}) ${text}"
     shift 2
   done
+
   local sel=""
   while true; do
-    read -r -p "Select: " sel
-    if [[ -n "${sel}" ]]; then
-      echo "${sel}"
-      return 0
-    fi
+    read -r -p "Select (enter a number): " sel
+    case "${sel}" in
+      1|2) echo "${sel}"; return 0 ;;
+      *) >&2 echo "Invalid selection. Please enter 1 or 2." ;;
+    esac
   done
 }
 
 prompt_port_with_default () {
   local label="$1"
   local default_port="$2"
-  local change
   local port="${default_port}"
+  local change=""
 
-  change="$(prompt_yes_no "Change default ${label} port ${default_port}?" "n")"
+  change="$(prompt_yes_no "Change ${label} port from default ${default_port}?" "n")"
   if [[ "${change}" == "y" ]]; then
     while true; do
-      port="$(prompt_text "Enter ${label} port")"
+      port="$(prompt_text "Enter ${label} port (1–65535)" "${default_port}")"
       if [[ "${port}" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )); then
         break
       fi
-      echo "Invalid port. Enter a number 1-65535."
+      >&2 echo "Invalid port. Enter a number 1–65535."
     done
   fi
 
@@ -110,31 +137,29 @@ prompt_port_with_default () {
 
 prompt_secret () {
   local label="$1"
+  local hint="${2:-}"
   local var=""
-  read -r -s -p "${label}: " var
+
+  >&2 echo -e "\n${label}"
+  if [[ -n "${hint}" ]]; then
+    >&2 echo "  ${hint}"
+  fi
+  read -r -s -p "> " var
   echo
   echo "${var}"
 }
 
 mask_set () {
-  # prints "set" or "blank" (never show secret)
   local v="$1"
   if [[ -n "${v}" ]]; then echo "set"; else echo "blank"; fi
-}
-
-restart_service_if_present () {
-  if systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"; then
-    systemctl daemon-reload || true
-    systemctl restart "${SERVICE_NAME}.service" || true
-  fi
 }
 
 # ============================================================
 # Mode selection
 # ============================================================
-MODE="$(prompt_choice "Choose mode:" \
-  "1" "Full install (deps + config + install script + optional service)" \
-  "2" "Reconfigure only (rewrite config, optionally restart service)")"
+MODE="$(prompt_choice "Choose installer mode:" \
+  "1" "Full install (apt + pip + write config + install script + optional systemd service)" \
+  "2" "Reconfigure only (rewrite config; optionally restart service; NO apt/pip changes)")"
 
 FULL_INSTALL="n"
 case "${MODE}" in
@@ -144,6 +169,27 @@ case "${MODE}" in
 esac
 
 echo "==> ${PROJECT_NAME} installer (root)"
+echo "==> Script source:    ${SCRIPT_SOURCE}"
+echo "==> Install target:   ${INSTALL_PATH}"
+echo "==> Service name:     ${SERVICE_NAME}.service"
+echo "==> Config file:      ${CONF_FILE}"
+echo "==> Log directory:    ${LOG_DIR}"
+
+# ============================================================
+# Preflight checks (Full install)
+# ============================================================
+if [[ "${FULL_INSTALL}" == "y" ]]; then
+  if [[ ! -f "${SCRIPT_SOURCE}" ]]; then
+    echo "ERROR: Could not find ${SCRIPT_SOURCE} in $(pwd)"
+    echo "Make sure you're running this from the repo root."
+    echo "If the file name differs, run:"
+    echo "  sudo SCRIPT_SOURCE=yourfile.py ./install.sh"
+    exit 1
+  fi
+  if [[ ! -f "${REQ_FILE}" ]]; then
+    echo "WARN: ${REQ_FILE} not found in $(pwd). pip requirements step will be skipped."
+  fi
+fi
 
 # ============================================================
 # 1) Install deps (full install only)
@@ -158,9 +204,6 @@ if [[ "${FULL_INSTALL}" == "y" ]]; then
     python3-pip \
     python3-setuptools \
     python3-wheel \
-    python3-rpi.gpio \
-    i2c-tools \
-    libraspberrypi-bin \
     git \
     ca-certificates
 
@@ -170,8 +213,6 @@ if [[ "${FULL_INSTALL}" == "y" ]]; then
   if [[ -f "${REQ_FILE}" ]]; then
     echo "==> Installing Python requirements: ${REQ_FILE}"
     pip3 install --break-system-packages -r "${REQ_FILE}"
-  else
-    echo "!! ${REQ_FILE} not found. Create requirements.txt in the repo."
   fi
 else
   echo "==> Reconfigure-only: skipping apt/pip installs"
@@ -180,23 +221,25 @@ fi
 # ============================================================
 # 2) Interactive config
 # ============================================================
-echo
-echo "==> Configuration (saved to ${CONF_FILE})"
-echo
+>&2 echo
+>&2 echo "==> Configuration"
+>&2 echo "This will write: ${CONF_FILE}"
+>&2 echo " - File permissions: 0600 (root-only)"
+>&2 echo " - Tip: press Enter to accept defaults."
 
-HA_HOST="$(prompt_default "Home Assistant IP/hostname (optional)" "")"
+HA_HOST="$(prompt_default "Home Assistant host (optional)" "" "homeassistant.local or 192.168.1.10")"
 HA_PORT="$(prompt_port_with_default "Home Assistant" "${DEFAULT_HA_PORT}")"
 
-MQTT_HOST="$(prompt_default "MQTT broker IP/hostname" "192.168.1.8")"
+MQTT_HOST="$(prompt_default "MQTT broker host/IP" "192.168.1.8" "mqtt.local or 192.168.1.8")"
 MQTT_PORT="$(prompt_port_with_default "MQTT" "${DEFAULT_MQTT_PORT}")"
 
-MQTT_USER="$(prompt_text "MQTT username (leave blank for anonymous)")"
+MQTT_USER="$(prompt_text "MQTT username (leave blank for anonymous/no-auth broker)" "mqtt")"
 MQTT_PASS=""
 if [[ -n "${MQTT_USER}" ]]; then
-  MQTT_PASS="$(prompt_secret "MQTT password (hidden)")"
+  MQTT_PASS="$(prompt_secret "MQTT password (input hidden)" "Stored in ${CONF_FILE} (0600).")"
 fi
 
-HA_DISCOVERY_PREFIX="$(prompt_default "Home Assistant discovery prefix" "${DEFAULT_DISCOVERY_PREFIX}")"
+HA_DISCOVERY_PREFIX="$(prompt_default "Home Assistant discovery prefix" "${DEFAULT_DISCOVERY_PREFIX}" "homeassistant")"
 
 echo "==> Writing config file"
 mkdir -p "${CONF_DIR}"
@@ -206,7 +249,7 @@ cat > "${CONF_FILE}" <<EOF
 # ${PROJECT_NAME} configuration
 # Generated: $(date -Is)
 
-# Home Assistant (optional unless you add HA REST calls)
+# Home Assistant (optional unless used by your script)
 HA_HOST=${HA_HOST}
 HA_PORT=${HA_PORT}
 
@@ -216,7 +259,7 @@ MQTT_PORT=${MQTT_PORT}
 MQTT_USER=${MQTT_USER}
 MQTT_PASS=${MQTT_PASS}
 
-# HA discovery
+# Home Assistant discovery
 HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX}
 EOF
 
@@ -233,13 +276,6 @@ chmod 0755 "${LOG_DIR}"
 # 4) Install python script (full install only)
 # ============================================================
 if [[ "${FULL_INSTALL}" == "y" ]]; then
-  if [[ ! -f "${SCRIPT_SOURCE}" ]]; then
-    echo "ERROR: Could not find ${SCRIPT_SOURCE} in the current directory."
-    echo "If your file has a different name, run like:"
-    echo "  sudo SCRIPT_SOURCE=yourfile.py ./install.sh"
-    exit 1
-  fi
-
   echo "==> Installing ${SCRIPT_SOURCE} -> ${INSTALL_PATH}"
   install -m 0755 "${SCRIPT_SOURCE}" "${INSTALL_PATH}"
 else
@@ -251,23 +287,20 @@ fi
 # ============================================================
 DO_SERVICE="$(prompt_yes_no "Install/Update + enable systemd service now?" "y")"
 if [[ "${DO_SERVICE}" == "y" ]]; then
-  # service requires installed script path to exist
   if [[ ! -f "${INSTALL_PATH}" ]]; then
-    echo "!! ${INSTALL_PATH} not found."
+    echo "ERROR: ${INSTALL_PATH} not found."
     if [[ "${FULL_INSTALL}" == "n" ]]; then
-      echo "Reconfigure-only mode can't install the script. Re-run in Full install mode, or copy your script to:"
+      echo "Reconfigure-only mode does not install the script."
+      echo "Re-run in Full install mode, or manually copy your script to:"
       echo "  ${INSTALL_PATH}"
-      exit 1
-    else
-      echo "ERROR: script install failed earlier."
-      exit 1
     fi
+    exit 1
   fi
 
   echo "==> Writing systemd service: ${SERVICE_PATH}"
   cat > "${SERVICE_PATH}" <<EOF
 [Unit]
-Description=${PROJECT_NAME} (GPIO contacts + MQTT + optional OLED)
+Description=${PROJECT_NAME}
 After=network-online.target
 Wants=network-online.target
 
@@ -278,6 +311,7 @@ Group=root
 
 EnvironmentFile=${CONF_FILE}
 ExecStart=/usr/bin/python3 ${INSTALL_PATH}
+WorkingDirectory=/
 Restart=always
 RestartSec=2
 
@@ -302,17 +336,17 @@ fi
 echo
 echo "==================== SUMMARY ===================="
 echo "Mode:                 $([[ "${FULL_INSTALL}" == "y" ]] && echo "Full install" || echo "Reconfigure only")"
-echo "Config file:           ${CONF_FILE} (0600)"
-echo "Home Assistant host:   ${HA_HOST:-"(blank)"}"
-echo "Home Assistant port:   ${HA_PORT}"
-echo "MQTT host:             ${MQTT_HOST}"
-echo "MQTT port:             ${MQTT_PORT}"
-echo "MQTT username:         ${MQTT_USER:-"(blank/anonymous)"}"
-echo "MQTT password:         $(mask_set "${MQTT_PASS}")"
-echo "Discovery prefix:      ${HA_DISCOVERY_PREFIX}"
-echo "Installed script:      ${INSTALL_PATH} $([[ -f "${INSTALL_PATH}" ]] && echo "(present)" || echo "(missing)")"
-echo "Service file:          ${SERVICE_PATH} $([[ -f "${SERVICE_PATH}" ]] && echo "(present)" || echo "(missing)")"
-echo "Log dir:               ${LOG_DIR}"
+echo "Config file:          ${CONF_FILE} (0600)"
+echo "Home Assistant host:  ${HA_HOST:-"(blank)"}"
+echo "Home Assistant port:  ${HA_PORT}"
+echo "MQTT host:            ${MQTT_HOST}"
+echo "MQTT port:            ${MQTT_PORT}"
+echo "MQTT username:        ${MQTT_USER:-"(blank/anonymous)"}"
+echo "MQTT password:        $(mask_set "${MQTT_PASS}")"
+echo "Discovery prefix:     ${HA_DISCOVERY_PREFIX}"
+echo "Installed script:     ${INSTALL_PATH} $([[ -f "${INSTALL_PATH}" ]] && echo "(present)" || echo "(missing)")"
+echo "Service file:         ${SERVICE_PATH} $([[ -f "${SERVICE_PATH}" ]] && echo "(present)" || echo "(missing)")"
+echo "Log dir:              ${LOG_DIR}"
 echo "================================================="
 echo
 
@@ -322,8 +356,6 @@ if [[ "${DO_SERVICE}" == "y" ]]; then
   echo
   echo "Follow logs:"
   echo "  journalctl -u ${SERVICE_NAME}.service -f"
-  echo "  tail -f ${LOG_DIR}/service_log.log"
-  echo "  tail -f ${LOG_DIR}/core_log.log"
 else
   echo "To enable service later, re-run:"
   echo "  sudo ./install.sh"
