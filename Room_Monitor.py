@@ -979,6 +979,40 @@ def setup_mqtt():
     client.loop_start()
     return client
 
+def cleanup_discovery():
+    client = None
+    try:
+        client = mqtt.Client(client_id=DEVICE_ID + "_cleanup", clean_session=True)
+        if MQTT_USER:
+            client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+        client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+        client.loop_start()
+        time.sleep(0.5)  # wait for connection
+
+        # Delete all discovery topics for this device by publishing empty retained messages
+        for key in SENSORS.keys():
+            _delete_discovery(client, contact_discovery_topic(key), why="cleanup")
+            _delete_discovery(client, switch_discovery_topic(key), why="cleanup")
+        _delete_discovery(client, zone_select_discovery_topic(), why="cleanup")
+        _delete_discovery(client, class_select_discovery_topic(), why="cleanup")
+
+        time.sleep(0.5)  # ensure messages are sent before disconnecting
+        print("Discovery cleanup complete.")
+        return True
+
+    except Exception as e:
+        print(f"Cleanup failed: {e}")
+        return False
+
+    finally:
+        try:
+            if client is not None:
+                client.loop_stop()
+                client.disconnect()
+        except Exception:
+            pass
+
 # ============================================================
 # SIGNAL HANDLING
 # ============================================================
@@ -986,7 +1020,8 @@ def handle_exit(signum, frame):
     global RUNNING
     RUNNING = False
 
-# ============================================================
+
+# ==================================================
 # MAIN
 # ============================================================
 def main() -> int:
@@ -1096,6 +1131,10 @@ def main() -> int:
     return 0
 
 if __name__ == "__main__":
+    if "--cleanup" in sys.argv:
+        cleanup_discovery()
+        sys.exit(0)
+
     try:
         sys.exit(main())
     except Exception as e:
