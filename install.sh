@@ -40,6 +40,16 @@ DEFAULT_DISCOVERY_PREFIX="homeassistant"
 # ------------------------
 # Helpers (robust + clear)
 # ------------------------
+sanitize () {
+  # Remove CR/LF and trim leading/trailing whitespace
+  local v="${1:-}"
+  v="${v//$'\r'/}"
+  v="${v//$'\n'/}"
+  # trim spaces/tabs
+  v="$(printf '%s' "${v}" | xargs)"
+  printf '%s' "${v}"
+}
+
 prompt_text () {
   local label="$1"
   local example="${2:-}"
@@ -52,7 +62,7 @@ prompt_text () {
   fi
 
   read -r -p "> " var
-  echo "${var}"
+  sanitize "${var}"
 }
 
 prompt_default () {
@@ -69,9 +79,9 @@ prompt_default () {
 
   read -r -p "> " var
   if [[ -z "${var}" ]]; then
-    echo "${def}"
+    sanitize "${def}"
   else
-    echo "${var}"
+    sanitize "${var}"
   fi
 }
 
@@ -83,6 +93,7 @@ prompt_yes_no () {
   while true; do
     >&2 echo -e "\n${label}\n  Enter: y or n (default: ${def})"
     read -r -p "> " var
+    var="$(sanitize "${var}")"
     var="${var:-$def}"
     case "${var,,}" in
       y|yes) echo "y"; return 0 ;;
@@ -108,6 +119,7 @@ prompt_choice () {
   local sel=""
   while true; do
     read -r -p "Select (enter a number): " sel
+    sel="$(sanitize "${sel}")"
     case "${sel}" in
       1|2) echo "${sel}"; return 0 ;;
       *) >&2 echo "Invalid selection. Please enter 1 or 2." ;;
@@ -146,7 +158,7 @@ prompt_secret () {
   fi
   read -r -s -p "> " var
   echo
-  echo "${var}"
+  sanitize "${var}"
 }
 
 mask_set () {
@@ -207,9 +219,9 @@ if [[ "${FULL_INSTALL}" == "y" ]]; then
     git \
     ca-certificates
 
-  echo "==> Upgrading pip tooling"
+  echo "==> Ensuring pip tooling (safe on Debian/Raspbian)"
+  # Do NOT upgrade wheel via pip (wheel is often apt-managed and causes uninstall-no-record-file)
   pip3 install --upgrade --break-system-packages pip setuptools || true
-
 
   if [[ -f "${REQ_FILE}" ]]; then
     echo "==> Installing Python requirements: ${REQ_FILE}"
