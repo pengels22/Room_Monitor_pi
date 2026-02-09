@@ -5,12 +5,12 @@ set -euo pipefail
 # install.sh — Room Monitor installer (interactive)
 # Run: sudo ./install.sh
 #
-# What it does (Full install):
-#  - Installs OS deps (python3/pip/etc)
-#  - Installs pip deps from requirements.txt
-#  - Writes config to /etc/room_monitor/config.env (0600)
-#  - Installs script to /usr/local/bin/Room_Monitor.py
-#  - Optionally installs/enables systemd service: room_monitor.service
+# Full install does:
+#  - apt deps (python3/pip/etc)
+#  - pip deps from requirements.txt
+#  - writes config: /etc/room_monitor/config.env (0600)
+#  - installs script: /usr/local/bin/Room_Monitor.py
+#  - optional systemd service: room_monitor.service
 # ============================================================
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -41,11 +41,11 @@ DEFAULT_DISCOVERY_PREFIX="homeassistant"
 # Helpers (robust + clear)
 # ------------------------
 sanitize () {
-  # Remove CR/LF and trim leading/trailing whitespace
+  # Remove CR/LF and trim leading/trailing whitespace.
+  # Prevents "MQTT_PASS=\nsecret" config corruption.
   local v="${1:-}"
   v="${v//$'\r'/}"
   v="${v//$'\n'/}"
-  # trim spaces/tabs
   v="$(printf '%s' "${v}" | xargs)"
   printf '%s' "${v}"
 }
@@ -55,12 +55,11 @@ prompt_text () {
   local example="${2:-}"
   local var=""
 
+  >&2 echo
+  >&2 echo "${label}"
   if [[ -n "${example}" ]]; then
-    >&2 echo -e "\n${label}\n  Example: ${example}"
-  else
-    >&2 echo -e "\n${label}"
+    >&2 echo "  Example: ${example}"
   fi
-
   read -r -p "> " var
   sanitize "${var}"
 }
@@ -71,10 +70,11 @@ prompt_default () {
   local example="${3:-}"
   local var=""
 
+  >&2 echo
+  >&2 echo "${label}"
+  >&2 echo "  Default: ${def}"
   if [[ -n "${example}" ]]; then
-    >&2 echo -e "\n${label}\n  Default: ${def}\n  Example: ${example}"
-  else
-    >&2 echo -e "\n${label}\n  Default: ${def}"
+    >&2 echo "  Example: ${example}"
   fi
 
   read -r -p "> " var
@@ -91,7 +91,9 @@ prompt_yes_no () {
   local var=""
 
   while true; do
-    >&2 echo -e "\n${label}\n  Enter: y or n (default: ${def})"
+    >&2 echo
+    >&2 echo "${label}"
+    >&2 echo "  Enter: y or n (default: ${def})"
     read -r -p "> " var
     var="$(sanitize "${var}")"
     var="${var:-$def}"
@@ -104,7 +106,7 @@ prompt_yes_no () {
 }
 
 prompt_choice () {
-  # Print menu to stderr, echo ONLY the selected value to stdout.
+  # Prints menu to stderr, echoes ONLY selection to stdout.
   local title="$1"
   shift
 
@@ -118,7 +120,7 @@ prompt_choice () {
 
   local sel=""
   while true; do
-    read -r -p "Select (enter a number): " sel
+    read -r -p "Select (enter 1 or 2): " sel
     sel="$(sanitize "${sel}")"
     case "${sel}" in
       1|2) echo "${sel}"; return 0 ;;
@@ -152,7 +154,8 @@ prompt_secret () {
   local hint="${2:-}"
   local var=""
 
-  >&2 echo -e "\n${label}"
+  >&2 echo
+  >&2 echo "${label}"
   if [[ -n "${hint}" ]]; then
     >&2 echo "  ${hint}"
   fi
@@ -164,6 +167,19 @@ prompt_secret () {
 mask_set () {
   local v="$1"
   if [[ -n "${v}" ]]; then echo "set"; else echo "blank"; fi
+}
+
+validate_env_file () {
+  local file="$1"
+  # Allow: blank lines, comments, KEY=VALUE
+  if grep -nEv '^\s*$|^\s*#|^[A-Z0-9_]+=.*$' "${file}" >/tmp/"${PROJECT_NAME}"_badlines.txt; then
+    echo "ERROR: ${file} contains invalid lines (likely a pasted newline in a value)."
+    echo "Bad lines:"
+    cat /tmp/"${PROJECT_NAME}"_badlines.txt
+    rm -f /tmp/"${PROJECT_NAME}"_badlines.txt
+    exit 1
+  fi
+  rm -f /tmp/"${PROJECT_NAME}"_badlines.txt
 }
 
 # ============================================================
@@ -277,6 +293,9 @@ HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX}
 EOF
 
 chmod 0600 "${CONF_FILE}"
+
+echo "==> Validating config file format"
+validate_env_file "${CONF_FILE}"
 
 # ============================================================
 # 3) Log dir (always)
