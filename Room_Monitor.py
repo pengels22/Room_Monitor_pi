@@ -27,7 +27,7 @@ import paho.mqtt.client as mqtt
 # ============================================================
 # MQTT / HA DISCOVERY CONFIG
 # ============================================================
-def _load_dotenv(path: str = ".env") -> None:
+def _load_dotenv(path: str) -> None:
     # tiny dotenv loader (no extra dependency)
     try:
         if not os.path.exists(path):
@@ -44,22 +44,19 @@ def _load_dotenv(path: str = ".env") -> None:
     except Exception:
         pass
 
-_load_dotenv()
+# Try a few common locations (installer uses EnvironmentFile, so this is best-effort only)
+_load_dotenv(".env")
+_load_dotenv(os.path.join(os.path.expanduser("~"), "room_monitor", "config", "config.env"))
 
 MQTT_HOST = os.getenv("MQTT_HOST", "192.168.1.8")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER = os.getenv("MQTT_USER", "mqtt")
-MQTT_PASS = os.getenv("MQTT_PASS", "")
+MQTT_USER = os.getenv("MQTT_USER", "")  # blank = anonymous
+MQTT_PASS = os.getenv("MQTT_PASS", "")  # blank = anonymous
 HA_DISCOVERY_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
-
-if not MQTT_PASS:
-    raise RuntimeError("MQTT_PASS is not set. Put it in .env (not committed) or environment variables.")
-
 
 # ============================================================
 # HOSTNAME -> DEVICE ID (automatic)
 # ============================================================
-
 def slugify(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9_]+", "_", s)
@@ -89,9 +86,22 @@ SENSORS: Dict[str, Dict[str, Any]] = {
     "zone9":  {"name": "Zone 9",  "pin": 17, "device_class": "opening"},
     "zone10": {"name": "Zone 10", "pin": 23, "device_class": "opening"},
 }
-
 ZONE_KEYS = list(SENSORS.keys())
-VALID_CLASSES = ["door", "window", "opening"]
+
+# - output_toggle = normal ON/OFF switch
+# - output_tap    = momentary (auto-OFF after OUTPUT_TAP_SEC)
+VALID_CLASSES = ["door", "window", "opening", "output_toggle", "output_tap"]
+
+OUTPUT_TAP_SEC = 0.5
+OUTPUT_CLASSES = {"output_toggle", "output_tap"}
+
+ICON_BY_CLASS = {
+    "output_toggle": "mdi:toggle-switch",
+    "output_tap":    "mdi:gesture-tap-button",
+}
+
+def is_output_class(cls: str) -> bool:
+    return (cls or "").strip().lower() in OUTPUT_CLASSES
 
 ZONE_PLACEHOLDER = "-- Select Zone --"
 CLASS_PLACEHOLDER = "-- Select Class --"
@@ -104,9 +114,9 @@ CLASS_SELECT_OPTIONS = [CLASS_PLACEHOLDER] + VALID_CLASSES
 # ============================================================
 # Prefer /var/lib if running as systemd service; falls back to ~/.config
 PERSIST_DIRS = [
-    "/var/lib/shed_gpio_mqtt",
-    "/etc/shed_gpio_mqtt",
-    os.path.join(os.path.expanduser("~"), ".config", "shed_gpio_mqtt"),
+    "/var/lib/room_monitor",
+    "/etc/room_monitor",
+    os.path.join(os.path.expanduser("~"), ".config", "room_monitor"),
 ]
 CONFIG_PATH = None
 for d in PERSIST_DIRS:
@@ -180,7 +190,7 @@ CHROMIUM_ESCALATE_WINDOW_SEC = 300
 # ============================================================
 # LOGGING
 # ============================================================
-LOG_DIR = "/var/log/shed"
+LOG_DIR = "/var/log/room_monitor"
 CORE_LOG_PATH = os.path.join(LOG_DIR, "core_log.log")
 SERVICE_LOG_PATH = os.path.join(LOG_DIR, "service_log.log")
 CHROM_LOG_PATH = os.path.join(LOG_DIR, "chrom_log.log")
@@ -235,28 +245,33 @@ CHROM_LOG = make_logger("chrom", CHROM_LOG_PATH)
 def availability_topic() -> str:
     return f"{HOST}/availability"
 
+# ---- INPUT (binary_sensor) topics ----
 def contact_state_topic(sensor_key: str) -> str:
-    # monitor1_zone1/state
     return f"{HOST}_{sensor_key}/state"
 
 def contact_discovery_topic(sensor_key: str) -> str:
-    # homeassistant/binary_sensor/monitor1/zone1/config
     return f"{HA_DISCOVERY_PREFIX}/binary_sensor/{HOST}/{sensor_key}/config"
 
+# ---- OUTPUT (switch) topics ----
+def switch_state_topic(sensor_key: str) -> str:
+    return f"{HOST}_{sensor_key}/switch/state"
+
+def switch_command_topic(sensor_key: str) -> str:
+    return f"{HOST}_{sensor_key}/switch/set"
+
+def switch_discovery_topic(sensor_key: str) -> str:
+    return f"{HA_DISCOVERY_PREFIX}/switch/{HOST}/{sensor_key}/config"
+
 # ---- MQTT Select entities (dropdowns) ----
-# command topics (HA -> script)
 TOP_ZONE_SET = f"{HOST}/zone_select/set"
 TOP_CLASS_SET = f"{HOST}/class_select/set"
-# state topics (script -> HA)
 TOP_ZONE_STATE = f"{HOST}/zone_select/state"
 TOP_CLASS_STATE = f"{HOST}/class_select/state"
 
 def zone_select_discovery_topic() -> str:
-    # homeassistant/select/monitor1/zone_select/config
     return f"{HA_DISCOVERY_PREFIX}/select/{HOST}/zone_select/config"
 
 def class_select_discovery_topic() -> str:
-    # homeassistant/select/monitor1/class_select/config
     return f"{HA_DISCOVERY_PREFIX}/select/{HOST}/class_select/config"
 
 def _get_ip_best_effort() -> str:
@@ -272,8 +287,15 @@ def _fingerprint(priority: int, message: str, meta: Optional[dict]) -> Tuple[Any
     return (priority, message, json.dumps(meta, sort_keys=True) if meta is not None else None)
 
 def get_open_keys_ordered() -> list[str]:
+    # only input-type zones contribute to "open" aggregation
     with _state_lock:
-        return [k for k in SENSORS.keys() if _contact_states.get(k, False)]
+        keys: list[str] = []
+        for k, meta in SENSORS.items():
+            if is_output_class(meta.get("device_class", "")):
+                continue
+            if _contact_states.get(k, False):
+                keys.append(k)
+        return keys
 
 # ============================================================
 # ErrorBus (priority stack + log-on-change)
@@ -289,13 +311,6 @@ class ErrorItem:
     meta: Optional[dict] = None
 
 class ErrorBus:
-    """
-    Thread-safe error stack:
-    - raise_error(key, msg, prio, meta, kind)
-      * Logs only on meaningful change (first raise, message/priority/meta changes).
-    - clear_error(key) logs resolution once.
-    - snapshot_top() returns highest priority active error (by priority then oldest).
-    """
     def __init__(self):
         self._lock = threading.Lock()
         self._errors: Dict[str, ErrorItem] = {}
@@ -326,13 +341,8 @@ class ErrorBus:
                     e.meta = meta
             else:
                 self._errors[key] = ErrorItem(
-                    key=key,
-                    message=message,
-                    priority=priority,
-                    since=now,
-                    last_update=now,
-                    count=1,
-                    meta=meta
+                    key=key, message=message, priority=priority,
+                    since=now, last_update=now, count=1, meta=meta
                 )
             self._dirty = True
 
@@ -454,101 +464,6 @@ def throttle_monitor_loop():
         time.sleep(THROTTLE_POLL_SEC)
 
 # ============================================================
-# Chromium supervisor (optional)
-# ============================================================
-def mem_available_mb() -> Optional[int]:
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    kb = int(line.split()[1])
-                    return kb // 1024
-    except Exception:
-        return None
-    return None
-
-def journal_tail(unit_name: str, lines=60) -> str:
-    try:
-        return subprocess.check_output(
-            ["journalctl", "-u", unit_name, "-n", str(lines), "--no-pager"],
-            text=True
-        ).strip()
-    except Exception as e:
-        return f"(journalctl failed: {e})"
-
-def kernel_tail(lines=80) -> str:
-    try:
-        return subprocess.check_output(
-            ["journalctl", "-k", "-n", str(lines), "--no-pager"],
-            text=True
-        ).strip()
-    except Exception as e:
-        return f"(kernel journal failed: {e})"
-
-class ChromiumSupervisor:
-    def __init__(self):
-        self.restart_times: list[float] = []
-
-    def _record_crash(self) -> int:
-        now = time.monotonic()
-        self.restart_times = [t for t in self.restart_times if (now - t) <= CHROMIUM_ESCALATE_WINDOW_SEC]
-        self.restart_times.append(now)
-        return len(self.restart_times)
-
-    def _systemd_is_active(self) -> bool:
-        try:
-            out = subprocess.check_output(["systemctl", "is-active", CHROMIUM_SYSTEMD_UNIT], text=True).strip()
-            return out == "active"
-        except Exception:
-            return False
-
-    def _restart(self):
-        try:
-            subprocess.check_call(["systemctl", "restart", CHROMIUM_SYSTEMD_UNIT])
-        except Exception as e:
-            CHROM_LOG.error(f"CHROMIUM_RESTART_FAIL | {e}")
-
-    def _stop(self):
-        try:
-            subprocess.check_call(["systemctl", "stop", CHROMIUM_SYSTEMD_UNIT])
-        except Exception as e:
-            CHROM_LOG.error(f"CHROMIUM_STOP_FAIL | {e}")
-
-    def loop(self):
-        while RUNNING:
-            active = self._systemd_is_active()
-            if not active:
-                crashes = self._record_crash()
-                avail = mem_available_mb()
-
-                CHROM_LOG.warning(f"CHROMIUM_DOWN | crashes_in_window={crashes} | mem_avail={avail}MB")
-                CHROM_LOG.info(f"CHROMIUM_JOURNAL_TAIL ({CHROMIUM_SYSTEMD_UNIT})\n{journal_tail(CHROMIUM_SYSTEMD_UNIT)}")
-                CHROM_LOG.info("KERNEL_TAIL\n" + kernel_tail())
-
-                if crashes < CHROMIUM_ESCALATE_MAX_CRASHES:
-                    ERRORS.raise_error(
-                        "CHROMIUM_CRASH",
-                        f"Chromium down ({crashes}) restarting",
-                        P_MED,
-                        meta={"crashes": crashes, "mem_avail_mb": avail},
-                        kind="error"
-                    )
-                    self._restart()
-                else:
-                    ERRORS.raise_error(
-                        "CHROMIUM_CRASH",
-                        f"Chromium failing ({crashes}) KILLED",
-                        P_HIGH,
-                        meta={"crashes": crashes, "mem_avail_mb": avail},
-                        kind="error"
-                    )
-                    self._stop()
-            else:
-                ERRORS.clear_error("CHROMIUM_CRASH", kind="error")
-
-            time.sleep(CHROMIUM_CHECK_SEC)
-
-# ============================================================
 # OLED manager (error-only, fail-silent)
 # ============================================================
 class OledManager:
@@ -644,11 +559,31 @@ class OledManager:
 def is_contact_open(pin: int) -> bool:
     return GPIO.input(pin) == GPIO.HIGH  # pull-up; HIGH means OPEN
 
+def _gpio_setup_for_zone(zone_key: str) -> None:
+    meta = SENSORS[zone_key]
+    pin = int(meta["pin"])
+    cls = meta.get("device_class", "opening")
+
+    if is_output_class(cls):
+        # Output zone default OFF
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+    else:
+        # Input zone pull-up
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
 def setup_gpio() -> None:
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
-    for meta in SENSORS.values():
-        GPIO.setup(int(meta["pin"]), GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    for key in SENSORS.keys():
+        _gpio_setup_for_zone(key)
+
+def get_output_state(zone_key: str) -> str:
+    pin = int(SENSORS[zone_key]["pin"])
+    return "ON" if GPIO.input(pin) == GPIO.HIGH else "OFF"
+
+def set_output_state(zone_key: str, on: bool) -> None:
+    pin = int(SENSORS[zone_key]["pin"])
+    GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
 
 # ============================================================
 # Door aggregate (low priority state)
@@ -689,38 +624,80 @@ def safe_publish(client, topic: str, payload: str, qos=1, retain=True, context: 
         ERRORS.raise_error("MQTT_PUB_FAIL", f"MQTT publish failed: {context} {e}", P_HIGH, kind="error")
 
 # ============================================================
-# HA Discovery for sensors
+# HA Discovery for entities (input=binary_sensor, output=switch)
 # ============================================================
-def publish_contact_discovery_one(client, sensor_key: str) -> None:
-    avail = availability_topic()
-    device_block = {
+def _device_block() -> dict:
+    return {
         "name": DEVICE_NAME,
         "identifiers": [DEVICE_ID],
         "manufacturer": "Raspberry Pi",
-        "model": f"GPIO Sensors ({HOST})",
+        "model": f"GPIO IO ({HOST})",
     }
 
-    meta = SENSORS[sensor_key]
-    payload = {
-        "name": meta["name"],                        # rename in HA UI if desired
-        "unique_id": f"{HOST}_{sensor_key}",         # monitor1_zone1
-        "state_topic": contact_state_topic(sensor_key),
-        "availability_topic": avail,
-        "payload_available": "online",
-        "payload_not_available": "offline",
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "device_class": meta.get("device_class", "opening"),
-        "device": device_block,
-    }
-    safe_publish(client, contact_discovery_topic(sensor_key), json.dumps(payload), qos=1, retain=True, context=f"discovery:{sensor_key}")
+def _delete_discovery(client, topic: str, why: str = "") -> None:
+    # Empty retained payload deletes entity from HA discovery
+    safe_publish(client, topic, "", qos=1, retain=True, context=f"delete:{why}")
 
-def publish_contact_discovery_all(client) -> None:
+def publish_entity_discovery_one(client, zone_key: str) -> None:
+    avail = availability_topic()
+    meta = SENSORS[zone_key]
+    cls = meta.get("device_class", "opening")
+
+    if is_output_class(cls):
+        payload = {
+            "name": meta["name"],
+            "unique_id": f"{HOST}_{zone_key}_sw",
+            "state_topic": switch_state_topic(zone_key),
+            "command_topic": switch_command_topic(zone_key),
+            "availability_topic": avail,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "state_on": "ON",
+            "state_off": "OFF",
+            "icon": ICON_BY_CLASS.get(cls, "mdi:toggle-switch"),
+            "device": _device_block(),
+        }
+        safe_publish(client, switch_discovery_topic(zone_key), json.dumps(payload), qos=1, retain=True,
+                     context=f"discovery:switch:{zone_key}")
+    else:
+        payload = {
+            "name": meta["name"],
+            "unique_id": f"{HOST}_{zone_key}_bin",
+            "state_topic": contact_state_topic(zone_key),
+            "availability_topic": avail,
+            "payload_available": "online",
+            "payload_not_available": "offline",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "device_class": cls,
+            "device": _device_block(),
+        }
+        safe_publish(client, contact_discovery_topic(zone_key), json.dumps(payload), qos=1, retain=True,
+                     context=f"discovery:binary:{zone_key}")
+
+def publish_entity_discovery_all(client) -> None:
     for key in SENSORS.keys():
-        publish_contact_discovery_one(client, key)
+        publish_entity_discovery_one(client, key)
 
+def publish_entity_state_one(client, zone_key: str) -> None:
+    cls = SENSORS[zone_key].get("device_class", "opening")
+    if is_output_class(cls):
+        safe_publish(client, switch_state_topic(zone_key), get_output_state(zone_key), qos=1, retain=True,
+                     context=f"switch_state:{zone_key}")
+    else:
+        publish_contact_state(client, zone_key)
+
+# ============================================================
+# Input state publish (binary sensors)
+# ============================================================
 def publish_contact_state(client, sensor_key: str) -> None:
     global _last_contact_change_key, _last_contact_change_is_open
+
+    # ignore if configured as output
+    if is_output_class(SENSORS[sensor_key].get("device_class", "")):
+        return
 
     pin = int(SENSORS[sensor_key]["pin"])
     is_open = is_contact_open(pin)
@@ -750,12 +727,7 @@ def publish_contact_state(client, sensor_key: str) -> None:
 # HA Discovery for dropdowns (MQTT Select)
 # ============================================================
 def publish_zone_class_select_discovery(client) -> None:
-    device_block = {
-        "name": DEVICE_NAME,
-        "identifiers": [DEVICE_ID],
-        "manufacturer": "Raspberry Pi",
-        "model": f"GPIO Sensors ({HOST})",
-    }
+    device_block = _device_block()
 
     zone_payload = {
         "name": f"{HOST} Zone Select",
@@ -785,7 +757,6 @@ def publish_zone_class_select_discovery(client) -> None:
     }
     safe_publish(client, class_select_discovery_topic(), json.dumps(class_payload), qos=1, retain=True, context="select:class")
 
-    # Seed defaults (valid option + retained)
     global _selected_zone, _selected_class
     with _select_lock:
         _selected_zone = ZONE_PLACEHOLDER
@@ -809,13 +780,40 @@ def _apply_zone_class_change(client, zone_key: str, new_class: str) -> None:
     if old == new_class:
         return
 
-    SENSORS[zone_key]["device_class"] = new_class
+    old_is_out = is_output_class(old)
+    new_is_out = is_output_class(new_class)
 
+    # 1) Persist
+    SENSORS[zone_key]["device_class"] = new_class
     persisted = load_zone_classes()
     persisted[zone_key] = new_class
     save_zone_classes(persisted)
 
-    publish_contact_discovery_one(client, zone_key)
+    # 2) Reconfigure GPIO mode
+    try:
+        _gpio_setup_for_zone(zone_key)
+    except Exception as e:
+        ERRORS.raise_error("GPIO_MODE", f"GPIO mode set failed: {zone_key} {e}", P_HIGH, kind="error")
+
+    # 3) delete old discovery config so HA doesn't accumulate orphans
+    if old_is_out and not new_is_out:
+        _delete_discovery(client, switch_discovery_topic(zone_key), why=f"{zone_key}:switch->binary")
+    if (not old_is_out) and new_is_out:
+        _delete_discovery(client, contact_discovery_topic(zone_key), why=f"{zone_key}:binary->switch")
+
+    # 4) Publish new discovery
+    publish_entity_discovery_one(client, zone_key)
+
+    # 5) Subscribe for switch command if output, and seed state
+    try:
+        if new_is_out:
+            client.subscribe(switch_command_topic(zone_key), qos=1)
+            safe_publish(client, switch_state_topic(zone_key), get_output_state(zone_key), qos=1, retain=True,
+                         context=f"switch_seed:{zone_key}")
+        else:
+            publish_contact_state(client, zone_key)
+    except Exception:
+        pass
 
     SVC_LOG.info(f"ZONE_CLASS_SET {zone_key}: {old} -> {new_class}")
 
@@ -845,9 +843,9 @@ def _on_disconnect(client, userdata, disconnect_flags=None, reason_code=None, pr
 
 def _on_message(client, userdata, msg):
     """
-    Handles dropdown commands from HA:
-    - TOP_ZONE_SET: set selected zone (record it), then bounce UI back to placeholder
-    - TOP_CLASS_SET: apply class to last selected zone (if valid), then bounce UI back to placeholder
+    Handles:
+    - Select dropdowns (zone/class)
+    - Output switch commands (per-zone)
     """
     global _selected_zone, _selected_class
 
@@ -857,11 +855,65 @@ def _on_message(client, userdata, msg):
     except Exception:
         return
 
+    # -------- OUTPUT SWITCH COMMANDS --------
+    if topic.endswith("/switch/set"):
+        m = re.match(rf"^{re.escape(HOST)}_(zone\d+)/switch/set$", topic)
+        if not m:
+            return
+        zone_key = m.group(1)
+        if zone_key not in SENSORS:
+            return
+
+        cls = SENSORS[zone_key].get("device_class", "")
+        if not is_output_class(cls):
+            return
+
+        cmd = payload.upper()
+        if cmd not in ("ON", "OFF"):
+            return
+
+        try:
+            if cls == "output_toggle":
+                set_output_state(zone_key, cmd == "ON")
+                safe_publish(client, switch_state_topic(zone_key), cmd, qos=1, retain=True,
+                             context=f"switch_state:{zone_key}")
+                SVC_LOG.info(f"OUTPUT_TOGGLE {zone_key} -> {cmd}")
+                return
+
+            # cls == "output_tap"
+            if cmd == "OFF":
+                set_output_state(zone_key, False)
+                safe_publish(client, switch_state_topic(zone_key), "OFF", qos=1, retain=True,
+                             context=f"switch_state:{zone_key}:force_off")
+                SVC_LOG.info(f"OUTPUT_TAP {zone_key} -> OFF")
+                return
+
+            # cmd == "ON": pulse ON then auto-OFF
+            set_output_state(zone_key, True)
+            safe_publish(client, switch_state_topic(zone_key), "ON", qos=1, retain=True,
+                         context=f"switch_state:{zone_key}:on")
+
+            def _auto_off():
+                try:
+                    time.sleep(OUTPUT_TAP_SEC)
+                    set_output_state(zone_key, False)
+                    safe_publish(client, switch_state_topic(zone_key), "OFF", qos=1, retain=True,
+                                 context=f"switch_state:{zone_key}:auto_off")
+                except Exception as e:
+                    ERRORS.raise_error("GPIO_OUT", f"tap auto-off failed: {zone_key} {e}", P_HIGH, kind="error")
+
+            threading.Thread(target=_auto_off, daemon=True).start()
+            SVC_LOG.info(f"OUTPUT_TAP {zone_key} -> PULSE {OUTPUT_TAP_SEC}s")
+            return
+
+        except Exception as e:
+            ERRORS.raise_error("GPIO_OUT", f"GPIO output set failed: {zone_key} {e}", P_HIGH, kind="error")
+        return
+
     # -------- ZONE SELECT --------
     if topic == TOP_ZONE_SET:
         z = payload
 
-        # allow placeholder selection
         if z == ZONE_PLACEHOLDER:
             with _select_lock:
                 _selected_zone = ZONE_PLACEHOLDER
@@ -874,7 +926,6 @@ def _on_message(client, userdata, msg):
         with _select_lock:
             _selected_zone = z
 
-        # bounce UI back
         safe_publish(client, TOP_ZONE_STATE, ZONE_PLACEHOLDER, qos=1, retain=True, context="zone_state:bounce")
         SVC_LOG.info(f"SELECT zone -> {z} (bounced to placeholder)")
         return
@@ -883,7 +934,6 @@ def _on_message(client, userdata, msg):
     if topic == TOP_CLASS_SET:
         c = payload
 
-        # allow placeholder selection
         if c == CLASS_PLACEHOLDER:
             with _select_lock:
                 _selected_class = CLASS_PLACEHOLDER
@@ -898,20 +948,22 @@ def _on_message(client, userdata, msg):
             _selected_class = c
             z = _selected_zone
 
-        # Apply only if a real zone was selected
         if z in SENSORS:
             _apply_zone_class_change(client, z, c)
             SVC_LOG.info(f"SELECT class -> {c} (applied to {z})")
         else:
             SVC_LOG.info(f"SELECT class -> {c} (no zone selected; ignored)")
 
-        # bounce UI back
         safe_publish(client, TOP_CLASS_STATE, CLASS_PLACEHOLDER, qos=1, retain=True, context="class_state:bounce")
         return
 
 def setup_mqtt():
     client = mqtt.Client(client_id=DEVICE_ID, clean_session=True)
-    client.username_pw_set(MQTT_USER, MQTT_PASS)
+
+    # Anonymous allowed: only set creds if user provided
+    if MQTT_USER:
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+
     client.will_set(availability_topic(), payload="offline", qos=1, retain=True)
 
     client.on_connect = _on_connect
@@ -957,31 +1009,29 @@ def main() -> int:
     if THROTTLE_MONITOR_ENABLED:
         threading.Thread(target=throttle_monitor_loop, daemon=True).start()
 
-    if CHROMIUM_MONITOR_ENABLED:
-        threading.Thread(target=ChromiumSupervisor().loop, daemon=True).start()
-
     try:
         client = setup_mqtt()
     except Exception:
         client = None
 
     if client:
-        # Publish availability
         safe_publish(client, availability_topic(), "online", qos=1, retain=True, context="availability:online")
 
-        # Publish dropdown discovery + seed placeholder states
         publish_zone_class_select_discovery(client)
-
-        # Subscribe to dropdown command topics
         client.subscribe(TOP_ZONE_SET, qos=1)
         client.subscribe(TOP_CLASS_SET, qos=1)
 
-        # Publish sensor discovery + seed states
-        publish_contact_discovery_all(client)
+        # Publish discovery + initial states
+        publish_entity_discovery_all(client)
         for key in SENSORS.keys():
-            publish_contact_state(client, key)
+            publish_entity_state_one(client, key)
 
-    # edge-detect if possible; poll fallback if not
+        # Subscribe switch topics for any output zones
+        for key, meta in SENSORS.items():
+            if is_output_class(meta.get("device_class", "")):
+                client.subscribe(switch_command_topic(key), qos=1)
+
+    # edge-detect if possible; poll fallback if not (INPUT zones only)
     polled_keys: set[str] = set()
 
     def make_cb(sensor_key: str):
@@ -992,6 +1042,8 @@ def main() -> int:
         return _cb
 
     for key, meta in SENSORS.items():
+        if is_output_class(meta.get("device_class", "")):
+            continue
         try:
             GPIO.add_event_detect(int(meta["pin"]), GPIO.BOTH, callback=make_cb(key), bouncetime=BOUNCE_MS)
         except RuntimeError:
@@ -1005,9 +1057,13 @@ def main() -> int:
     while RUNNING:
         now = time.monotonic()
 
-        # poll any sensors that couldn't use edge detection
+        # poll any sensors that couldn't use edge detection (INPUT zones only)
         if polled_keys and client:
-            for k in polled_keys:
+            for k in list(polled_keys):
+                if is_output_class(SENSORS[k].get("device_class", "")):
+                    # zone may have been flipped at runtime; stop polling it
+                    polled_keys.discard(k)
+                    continue
                 pin = int(SENSORS[k]["pin"])
                 v = GPIO.input(pin)
                 if last_polled[k] is None or v != last_polled[k]:
