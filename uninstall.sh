@@ -16,6 +16,15 @@ echo "====================================="
 echo
 
 # ------------------------------------------------
+# Safety: refuse to run unless root (system paths)
+# ------------------------------------------------
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "ERROR: run with sudo:"
+  echo "  sudo ./uninstall.sh"
+  exit 1
+fi
+
+# ------------------------------------------------
 # Stop + disable systemd service
 # ------------------------------------------------
 echo "==> Stopping systemd service (if present)"
@@ -71,13 +80,47 @@ echo "==> Removing log directory: ${LOG_DIR}"
 rm -rf "${LOG_DIR}"
 
 # ------------------------------------------------
+# Remove project directory (repo folder where uninstall.sh lives)
+# ------------------------------------------------
+echo
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Safety rails: refuse to delete dangerous directories
+case "${SCRIPT_DIR}" in
+  "/"|"/root"|"/home"|"/home/"*"/"|"${HOME}" )
+    echo "⚠ Refusing to delete suspicious directory: ${SCRIPT_DIR}"
+    echo "If you really need to delete it, move uninstall.sh into the project folder and re-run."
+    ;;
+  *)
+    echo "==> Project directory detected:"
+    echo "    ${SCRIPT_DIR}"
+    echo
+    read -r -p "Remove this entire directory and ALL its contents? (y/n): " DELDIR
+    DELDIR="${DELDIR,,}"
+
+    if [[ "${DELDIR}" == "y" || "${DELDIR}" == "yes" ]]; then
+      echo "Removing project directory..."
+      rm -rf "${SCRIPT_DIR}"
+      echo "✅ Project directory removed."
+      # Note: cannot reliably delete $0 after rm -rf of its parent, so we stop here.
+      echo
+      echo "✅ Room Monitor fully removed (service + process + discovery + files + project directory)"
+      exit 0
+    else
+      echo "Project directory preserved."
+    fi
+    ;;
+esac
+
+# ------------------------------------------------
 # Final status
 # ------------------------------------------------
 echo
-echo "✅ Room Monitor fully removed (service + process + discovery + files)"
+echo "✅ Room Monitor removed (service + process + discovery + installed files)"
+echo "   (Project directory left intact: ${SCRIPT_DIR})"
 
 # ------------------------------------------------
-# Optional self delete
+# Optional self delete (only meaningful if project dir wasn't removed)
 # ------------------------------------------------
 read -r -p "Delete uninstall.sh itself? (y/n): " SELFDEL
 SELFDEL="${SELFDEL,,}"
