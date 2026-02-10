@@ -8,7 +8,8 @@ set -euo pipefail
 # Full install does:
 #  - apt deps (python3/pip/etc)
 #  - pip deps from requirements.txt
-#  - writes config: /etc/room_monitor/config.env (0600)
+#  - writes config: /etc/room_monitor/config.env (0600 by default)
+#    * If kiosk is enabled, relaxes to 0640 root:<kiosk_user> so the desktop user can read HA_HOST/HA_PORT
 #  - installs script: /usr/local/bin/Room_Monitor.py
 #  - optional systemd service: room_monitor.service
 #  - optional Chromium kiosk autostart (safe for X11 + Wayland)
@@ -243,9 +244,10 @@ if [[ "${FULL_INSTALL}" == "y" ]]; then
     git \
     ca-certificates
 
-  echo "==> Ensuring pip tooling (safe on Debian/Raspbian)"
-  # Do NOT upgrade wheel via pip (wheel is often apt-managed and causes uninstall-no-record-file)
-  pip3 install --upgrade --break-system-packages pip setuptools || true
+  echo "==> Ensuring pip tooling (Debian-safe)"
+  # IMPORTANT: Do NOT try to upgrade apt-managed pip (can cause uninstall-no-record-file)
+  # Also avoid upgrading wheel via pip (often apt-managed).
+  pip3 install --break-system-packages --upgrade setuptools || true
 
   if [[ -f "${REQ_FILE}" ]]; then
     echo "==> Installing Python requirements: ${REQ_FILE}"
@@ -261,7 +263,8 @@ fi
 >&2 echo
 >&2 echo "==> Configuration"
 >&2 echo "This will write: ${CONF_FILE}"
->&2 echo " - File permissions: 0600 (root-only)"
+>&2 echo " - Default permissions: 0600 (root-only)"
+>&2 echo " - If kiosk enabled: 0640 (root:<kiosk_user>) so kiosk can read HA_HOST/HA_PORT"
 >&2 echo " - Tip: press Enter to accept defaults."
 
 HA_HOST="$(prompt_default "Home Assistant host (optional)" "" "homeassistant.local or 192.168.1.10")"
@@ -273,7 +276,7 @@ MQTT_PORT="$(prompt_port_with_default "MQTT" "${DEFAULT_MQTT_PORT}")"
 MQTT_USER="$(prompt_text "MQTT username (leave blank for anonymous/no-auth broker)" "mqtt")"
 MQTT_PASS=""
 if [[ -n "${MQTT_USER}" ]]; then
-  MQTT_PASS="$(prompt_secret "MQTT password (input hidden)" "Stored in ${CONF_FILE} (0600).")"
+  MQTT_PASS="$(prompt_secret "MQTT password (input hidden)" "Stored in ${CONF_FILE}.")"
 fi
 
 HA_DISCOVERY_PREFIX="$(prompt_default "Home Assistant discovery prefix" "${DEFAULT_DISCOVERY_PREFIX}" "homeassistant")"
@@ -300,6 +303,8 @@ MQTT_PASS=${MQTT_PASS}
 HA_DISCOVERY_PREFIX=${HA_DISCOVERY_PREFIX}
 EOF
 
+# Default: root-only. If kiosk enabled, we'll adjust to 0640 root:<kiosk_user>.
+chown root:root "${CONF_FILE}"
 chmod 0600 "${CONF_FILE}"
 
 echo "==> Validating config file format"
@@ -317,6 +322,13 @@ if [[ "${DO_KIOSK}" == "y" ]]; then
     echo "ERROR: could not determine home for kiosk user: ${KIOSK_USER}"
     exit 1
   fi
+
+  # KEY FIX:
+  # Allow the desktop user to read HA_HOST/HA_PORT from config.env.
+  # This is still secure: 0640 root:<kiosk_user> (no world-read).
+  echo "==> Granting kiosk user read access to config (secure: 0640 root:${KIOSK_USER})"
+  chgrp "${KIOSK_USER}" "${CONF_FILE}"
+  chmod 0640 "${CONF_FILE}"
 
   if [[ "${FULL_INSTALL}" != "y" ]]; then
     echo "==> Kiosk install selected in reconfigure-only mode."
@@ -339,8 +351,19 @@ if [[ "${DO_KIOSK}" == "y" ]]; then
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Wayland autostart timing is sometimes too early — prevent silent Chromium failure
+sleep 8
+
+# Never run Chromium as root (it will fail without --no-sandbox and is a bad idea anyway)
+if [[ "${EUID}" -eq 0 ]]; then
+  echo "ERROR: Do not run kiosk as root. Run as the desktop user (e.g., pi)."
+  exit 1
+fi
+
 CONF_FILE="/etc/room_monitor/config.env"
-if [[ -f "${CONF_FILE}" ]]; then
+
+# Load config if readable (kiosk user should have read via 0640 root:<user>)
+if [[ -r "${CONF_FILE}" ]]; then
   set -a
   # shellcheck disable=SC1090
   source "${CONF_FILE}"
@@ -505,10 +528,12 @@ fi
 # ============================================================
 # 6) Summary (no secrets)
 # ============================================================
+CONF_PERMS="$(stat -c '%a %U:%G' "${CONF_FILE}" 2>/dev/null || echo "unknown")"
+
 echo
 echo "==================== SUMMARY ===================="
 echo "Mode:                 $([[ "${FULL_INSTALL}" == "y" ]] && echo "Full install" || echo "Reconfigure only")"
-echo "Config file:          ${CONF_FILE} (0600)"
+echo "Config file:          ${CONF_FILE} (${CONF_PERMS})"
 echo "Home Assistant host:  ${HA_HOST:-"(blank)"}"
 echo "Home Assistant port:  ${HA_PORT}"
 echo "MQTT host:            ${MQTT_HOST}"
@@ -540,6 +565,7 @@ if [[ "${DO_KIOSK:-n}" == "y" ]]; then
   echo " - Starts on next GUI login/boot for user: ${KIOSK_USER}"
   echo " - Uses Wayland-safe flags when Wayland is detected."
   echo " - Uses X11 power/blanking tweaks only when X11 is detected."
+  echo " - Kiosk launcher refuses to run as root."
 fi
 
 echo
