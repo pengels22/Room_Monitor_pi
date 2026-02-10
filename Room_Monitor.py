@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+Room_Monitor.py
+
+GPIO zones -> MQTT -> Home Assistant MQTT Discovery
++ zone/class selects (runtime class changes)
++ output zones (toggle or tap)
++ optional OLED (error-only)
++ optional CPU throttle monitor
++ Night Light (single GPIO switch entity)
++ "--cleanup" mode to delete retained HA discovery entities
+
+Wiring assumption for INPUT zones:
+- GPIO pull-up, contact to GND
+- HIGH = OPEN, LOW = CLOSED
+"""
 
 # ============================================================
 # Standard libs
@@ -25,10 +40,9 @@ import RPi.GPIO as GPIO
 import paho.mqtt.client as mqtt
 
 # ============================================================
-# MQTT / HA DISCOVERY CONFIG
+# Tiny dotenv loader (no extra dependency)
 # ============================================================
 def _load_dotenv(path: str) -> None:
-    # tiny dotenv loader (no extra dependency)
     try:
         if not os.path.exists(path):
             return
@@ -44,15 +58,20 @@ def _load_dotenv(path: str) -> None:
     except Exception:
         pass
 
-# Try a few common locations (installer uses EnvironmentFile, so this is best-effort only)
+
+# Best-effort only (systemd EnvironmentFile is primary)
 _load_dotenv(".env")
 _load_dotenv(os.path.join(os.path.expanduser("~"), "room_monitor", "config", "config.env"))
 
-MQTT_HOST = os.getenv("MQTT_HOST", "192.168.1.8")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER = os.getenv("MQTT_USER", "")  # blank = anonymous
-MQTT_PASS = os.getenv("MQTT_PASS", "")  # blank = anonymous
-HA_DISCOVERY_PREFIX = os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")
+def _env_clean(s: str) -> str:
+    # Protect against newline/CR getting into env values
+    return (s or "").replace("\r", "").replace("\n", "").strip()
+
+MQTT_HOST = _env_clean(os.getenv("MQTT_HOST", "192.168.1.8"))
+MQTT_PORT = int(_env_clean(os.getenv("MQTT_PORT", "1883")) or "1883")
+MQTT_USER = _env_clean(os.getenv("MQTT_USER", ""))          # blank = anonymous
+MQTT_PASS = _env_clean(os.getenv("MQTT_PASS", ""))          # blank = anonymous
+HA_DISCOVERY_PREFIX = _env_clean(os.getenv("HA_DISCOVERY_PREFIX", "homeassistant")) or "homeassistant"
 
 # ============================================================
 # HOSTNAME -> DEVICE ID (automatic)
@@ -63,12 +82,12 @@ def slugify(s: str) -> str:
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "monitor"
 
-HOST = slugify(socket.gethostname())      # e.g. "monitor1"
+HOST = slugify(socket.gethostname())      # e.g. "shed1"
 DEVICE_ID = HOST                          # discovery identifiers + mqtt client id
 DEVICE_NAME = HOST                        # shown as device name in HA
 
 # ============================================================
-# CONTACT CONFIG
+# CONTACT / ZONE CONFIG
 # ============================================================
 BOUNCE_MS = 120
 POLL_INTERVAL_SEC = 0.05  # main loop tick
@@ -89,7 +108,7 @@ SENSORS: Dict[str, Dict[str, Any]] = {
 ZONE_KEYS = list(SENSORS.keys())
 
 # - output_toggle = normal ON/OFF switch
-# - output_tap    = momentary (auto-OFF after OUTPUT_TAP_SEC)
+# - output_tap    = momentary pulse (auto-OFF after OUTPUT_TAP_SEC)
 VALID_CLASSES = ["door", "window", "opening", "output_toggle", "output_tap"]
 
 OUTPUT_TAP_SEC = 0.5
@@ -110,9 +129,18 @@ ZONE_SELECT_OPTIONS = [ZONE_PLACEHOLDER] + ZONE_KEYS
 CLASS_SELECT_OPTIONS = [CLASS_PLACEHOLDER] + VALID_CLASSES
 
 # ============================================================
+# NIGHT LIGHT (LED) OUTPUT CONFIG (simple HA switch)
+# ============================================================
+LED_GPIO = 24
+LED_ACTIVE_HIGH = True
+
+LED_STATE_TOPIC = f"{DEVICE_ID}/nightlight/state"
+LED_CMD_TOPIC   = f"{DEVICE_ID}/nightlight/set"
+LED_DISCOVERY_TOPIC = f"{HA_DISCOVERY_PREFIX}/switch/{DEVICE_ID}/nightlight/config"
+
+# ============================================================
 # Persisted config (zone classes)
 # ============================================================
-# Prefer /var/lib if running as systemd service; falls back to ~/.config
 PERSIST_DIRS = [
     "/var/lib/room_monitor",
     "/etc/room_monitor",
@@ -130,9 +158,7 @@ if CONFIG_PATH is None:
     CONFIG_PATH = os.path.join(os.path.expanduser("~"), f"{HOST}_zones.json")
 
 def load_zone_classes() -> Dict[str, str]:
-    """
-    Loads {"zone1":"door",...}. Missing zones default to "opening".
-    """
+    """Loads {"zone1":"door",...}. Missing zones default to 'opening'."""
     try:
         if not os.path.exists(CONFIG_PATH):
             return {}
@@ -157,7 +183,7 @@ def save_zone_classes(zmap: Dict[str, str]) -> None:
     except Exception:
         pass
 
-# apply persisted classes at boot
+# Apply persisted classes at boot
 _persisted = load_zone_classes()
 for zk, cls in _persisted.items():
     SENSORS[zk]["device_class"] = cls
@@ -179,7 +205,7 @@ THROTTLE_MONITOR_ENABLED = True
 THROTTLE_POLL_SEC = 2.0
 
 # ============================================================
-# CHROMIUM SUPERVISOR (OPTIONAL)
+# CHROMIUM SUPERVISOR (OPTIONAL - not used by default)
 # ============================================================
 CHROMIUM_MONITOR_ENABLED = False
 CHROMIUM_SYSTEMD_UNIT = "chromium-kiosk.service"
@@ -215,7 +241,6 @@ _mqtt_ok = False
 _last_contact_change_key: Optional[str] = None
 _last_contact_change_is_open: Optional[bool] = None
 
-# For dropdown selections
 _select_lock = threading.Lock()
 _selected_zone = ZONE_PLACEHOLDER
 _selected_class = CLASS_PLACEHOLDER
@@ -245,14 +270,12 @@ CHROM_LOG = make_logger("chrom", CHROM_LOG_PATH)
 def availability_topic() -> str:
     return f"{HOST}/availability"
 
-# ---- INPUT (binary_sensor) topics ----
 def contact_state_topic(sensor_key: str) -> str:
     return f"{HOST}_{sensor_key}/state"
 
 def contact_discovery_topic(sensor_key: str) -> str:
     return f"{HA_DISCOVERY_PREFIX}/binary_sensor/{HOST}/{sensor_key}/config"
 
-# ---- OUTPUT (switch) topics ----
 def switch_state_topic(sensor_key: str) -> str:
     return f"{HOST}_{sensor_key}/switch/state"
 
@@ -262,7 +285,6 @@ def switch_command_topic(sensor_key: str) -> str:
 def switch_discovery_topic(sensor_key: str) -> str:
     return f"{HA_DISCOVERY_PREFIX}/switch/{HOST}/{sensor_key}/config"
 
-# ---- MQTT Select entities (dropdowns) ----
 TOP_ZONE_SET = f"{HOST}/zone_select/set"
 TOP_CLASS_SET = f"{HOST}/class_select/set"
 TOP_ZONE_STATE = f"{HOST}/zone_select/state"
@@ -287,7 +309,6 @@ def _fingerprint(priority: int, message: str, meta: Optional[dict]) -> Tuple[Any
     return (priority, message, json.dumps(meta, sort_keys=True) if meta is not None else None)
 
 def get_open_keys_ordered() -> list[str]:
-    # only input-type zones contribute to "open" aggregation
     with _state_lock:
         keys: list[str] = []
         for k, meta in SENSORS.items():
@@ -298,7 +319,7 @@ def get_open_keys_ordered() -> list[str]:
         return keys
 
 # ============================================================
-# ErrorBus (priority stack + log-on-change)
+# ErrorBus
 # ============================================================
 @dataclass
 class ErrorItem:
@@ -565,17 +586,19 @@ def _gpio_setup_for_zone(zone_key: str) -> None:
     cls = meta.get("device_class", "opening")
 
     if is_output_class(cls):
-        # Output zone default OFF
-        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)  # default OFF
     else:
-        # Input zone pull-up
         GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 def setup_gpio() -> None:
     GPIO.setmode(GPIO.BCM)
     GPIO.setwarnings(False)
+
     for key in SENSORS.keys():
         _gpio_setup_for_zone(key)
+
+    # Night Light pin
+    GPIO.setup(LED_GPIO, GPIO.OUT, initial=(GPIO.LOW if LED_ACTIVE_HIGH else GPIO.HIGH))
 
 def get_output_state(zone_key: str) -> str:
     pin = int(SENSORS[zone_key]["pin"])
@@ -584,6 +607,18 @@ def get_output_state(zone_key: str) -> str:
 def set_output_state(zone_key: str, on: bool) -> None:
     pin = int(SENSORS[zone_key]["pin"])
     GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
+
+def night_light_is_on() -> bool:
+    v = GPIO.input(LED_GPIO)
+    if LED_ACTIVE_HIGH:
+        return v == GPIO.HIGH
+    return v == GPIO.LOW
+
+def night_light_set(on: bool) -> None:
+    if LED_ACTIVE_HIGH:
+        GPIO.output(LED_GPIO, GPIO.HIGH if on else GPIO.LOW)
+    else:
+        GPIO.output(LED_GPIO, GPIO.LOW if on else GPIO.HIGH)
 
 # ============================================================
 # Door aggregate (low priority state)
@@ -624,7 +659,7 @@ def safe_publish(client, topic: str, payload: str, qos=1, retain=True, context: 
         ERRORS.raise_error("MQTT_PUB_FAIL", f"MQTT publish failed: {context} {e}", P_HIGH, kind="error")
 
 # ============================================================
-# HA Discovery for entities (input=binary_sensor, output=switch)
+# HA Discovery + entity publish
 # ============================================================
 def _device_block() -> dict:
     return {
@@ -635,7 +670,6 @@ def _device_block() -> dict:
     }
 
 def _delete_discovery(client, topic: str, why: str = "") -> None:
-    # Empty retained payload deletes entity from HA discovery
     safe_publish(client, topic, "", qos=1, retain=True, context=f"delete:{why}")
 
 def publish_entity_discovery_one(client, zone_key: str) -> None:
@@ -681,21 +715,9 @@ def publish_entity_discovery_all(client) -> None:
     for key in SENSORS.keys():
         publish_entity_discovery_one(client, key)
 
-def publish_entity_state_one(client, zone_key: str) -> None:
-    cls = SENSORS[zone_key].get("device_class", "opening")
-    if is_output_class(cls):
-        safe_publish(client, switch_state_topic(zone_key), get_output_state(zone_key), qos=1, retain=True,
-                     context=f"switch_state:{zone_key}")
-    else:
-        publish_contact_state(client, zone_key)
-
-# ============================================================
-# Input state publish (binary sensors)
-# ============================================================
 def publish_contact_state(client, sensor_key: str) -> None:
     global _last_contact_change_key, _last_contact_change_is_open
 
-    # ignore if configured as output
     if is_output_class(SENSORS[sensor_key].get("device_class", "")):
         return
 
@@ -723,9 +745,14 @@ def publish_contact_state(client, sensor_key: str) -> None:
     if changed:
         SVC_LOG.info(f"SENSOR_CHANGE {sensor_key} -> {'OPEN' if is_open else 'CLOSED'}")
 
-# ============================================================
-# HA Discovery for dropdowns (MQTT Select)
-# ============================================================
+def publish_entity_state_one(client, zone_key: str) -> None:
+    cls = SENSORS[zone_key].get("device_class", "opening")
+    if is_output_class(cls):
+        safe_publish(client, switch_state_topic(zone_key), get_output_state(zone_key), qos=1, retain=True,
+                     context=f"switch_state:{zone_key}")
+    else:
+        publish_contact_state(client, zone_key)
+
 def publish_zone_class_select_discovery(client) -> None:
     device_block = _device_block()
 
@@ -764,6 +791,27 @@ def publish_zone_class_select_discovery(client) -> None:
 
     safe_publish(client, TOP_ZONE_STATE, ZONE_PLACEHOLDER, qos=1, retain=True, context="select:zone_default")
     safe_publish(client, TOP_CLASS_STATE, CLASS_PLACEHOLDER, qos=1, retain=True, context="select:class_default")
+
+def publish_night_light_discovery(client) -> None:
+    payload = {
+        "name": f"{HOST} Night Light",
+        "unique_id": f"{DEVICE_ID}_nightlight",
+        "state_topic": LED_STATE_TOPIC,
+        "command_topic": LED_CMD_TOPIC,
+        "availability_topic": availability_topic(),
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "state_on": "ON",
+        "state_off": "OFF",
+        "icon": "mdi:lightbulb-on-outline",
+        "device": _device_block(),
+    }
+    safe_publish(client, LED_DISCOVERY_TOPIC, json.dumps(payload), qos=1, retain=True, context="discovery:nightlight")
+
+def publish_night_light_state(client) -> None:
+    safe_publish(client, LED_STATE_TOPIC, ("ON" if night_light_is_on() else "OFF"), qos=1, retain=True, context="nightlight:state")
 
 def _apply_zone_class_change(client, zone_key: str, new_class: str) -> None:
     zone_key = str(zone_key).strip()
@@ -844,6 +892,7 @@ def _on_disconnect(client, userdata, disconnect_flags=None, reason_code=None, pr
 def _on_message(client, userdata, msg):
     """
     Handles:
+    - Night Light command
     - Select dropdowns (zone/class)
     - Output switch commands (per-zone)
     """
@@ -853,6 +902,18 @@ def _on_message(client, userdata, msg):
         topic = (msg.topic or "").strip()
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
     except Exception:
+        return
+
+    # -------- NIGHT LIGHT COMMAND --------
+    if topic == LED_CMD_TOPIC:
+        cmd = payload.upper()
+        if cmd in ("ON", "OFF"):
+            try:
+                night_light_set(cmd == "ON")
+                publish_night_light_state(client)
+                SVC_LOG.info(f"NIGHT LIGHT -> {cmd}")
+            except Exception as e:
+                ERRORS.raise_error("GPIO_LED", f"Night Light set failed: {e}", P_HIGH, kind="error")
         return
 
     # -------- OUTPUT SWITCH COMMANDS --------
@@ -908,7 +969,7 @@ def _on_message(client, userdata, msg):
 
         except Exception as e:
             ERRORS.raise_error("GPIO_OUT", f"GPIO output set failed: {zone_key} {e}", P_HIGH, kind="error")
-        return
+            return
 
     # -------- ZONE SELECT --------
     if topic == TOP_ZONE_SET:
@@ -957,10 +1018,12 @@ def _on_message(client, userdata, msg):
         safe_publish(client, TOP_CLASS_STATE, CLASS_PLACEHOLDER, qos=1, retain=True, context="class_state:bounce")
         return
 
+# ============================================================
+# MQTT setup
+# ============================================================
 def setup_mqtt():
     client = mqtt.Client(client_id=DEVICE_ID, clean_session=True)
 
-    # Anonymous allowed: only set creds if user provided
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
 
@@ -979,7 +1042,10 @@ def setup_mqtt():
     client.loop_start()
     return client
 
-def cleanup_discovery():
+# ============================================================
+# Discovery cleanup (for uninstall / manual cleanup)
+# ============================================================
+def cleanup_discovery() -> bool:
     client = None
     try:
         client = mqtt.Client(client_id=DEVICE_ID + "_cleanup", clean_session=True)
@@ -988,16 +1054,21 @@ def cleanup_discovery():
 
         client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
         client.loop_start()
-        time.sleep(0.5)  # wait for connection
+        time.sleep(0.5)
 
-        # Delete all discovery topics for this device by publishing empty retained messages
+        # Delete discovery configs for all zones (both forms)
         for key in SENSORS.keys():
             _delete_discovery(client, contact_discovery_topic(key), why="cleanup")
             _delete_discovery(client, switch_discovery_topic(key), why="cleanup")
+
+        # Deletes for selects
         _delete_discovery(client, zone_select_discovery_topic(), why="cleanup")
         _delete_discovery(client, class_select_discovery_topic(), why="cleanup")
 
-        time.sleep(0.5)  # ensure messages are sent before disconnecting
+        # Delete Night Light discovery
+        _delete_discovery(client, LED_DISCOVERY_TOPIC, why="cleanup")
+
+        time.sleep(0.5)
         print("Discovery cleanup complete.")
         return True
 
@@ -1020,8 +1091,7 @@ def handle_exit(signum, frame):
     global RUNNING
     RUNNING = False
 
-
-# ==================================================
+# ============================================================
 # MAIN
 # ============================================================
 def main() -> int:
@@ -1050,13 +1120,20 @@ def main() -> int:
         client = None
 
     if client:
+        # Online
         safe_publish(client, availability_topic(), "online", qos=1, retain=True, context="availability:online")
 
+        # Dropdowns
         publish_zone_class_select_discovery(client)
         client.subscribe(TOP_ZONE_SET, qos=1)
         client.subscribe(TOP_CLASS_SET, qos=1)
 
-        # Publish discovery + initial states
+        # Night Light discovery + state + subscribe
+        publish_night_light_discovery(client)
+        publish_night_light_state(client)
+        client.subscribe(LED_CMD_TOPIC, qos=1)
+
+        # Zone discovery + initial states
         publish_entity_discovery_all(client)
         for key in SENSORS.keys():
             publish_entity_state_one(client, key)
@@ -1066,7 +1143,7 @@ def main() -> int:
             if is_output_class(meta.get("device_class", "")):
                 client.subscribe(switch_command_topic(key), qos=1)
 
-    # edge-detect if possible; poll fallback if not (INPUT zones only)
+    # Edge-detect if possible; poll fallback if not (INPUT zones only)
     polled_keys: set[str] = set()
 
     def make_cb(sensor_key: str):
@@ -1092,11 +1169,10 @@ def main() -> int:
     while RUNNING:
         now = time.monotonic()
 
-        # poll any sensors that couldn't use edge detection (INPUT zones only)
+        # Poll any sensors that couldn't use edge detection (INPUT zones only)
         if polled_keys and client:
             for k in list(polled_keys):
                 if is_output_class(SENSORS[k].get("device_class", "")):
-                    # zone may have been flipped at runtime; stop polling it
                     polled_keys.discard(k)
                     continue
                 pin = int(SENSORS[k]["pin"])
@@ -1105,7 +1181,7 @@ def main() -> int:
                     last_polled[k] = v
                     publish_contact_state(client, k)
 
-        # aggregate state update (logs only on changes)
+        # Aggregate open/close state (logs only on changes)
         if now - last_agg_tick >= AGG_SEC:
             last_agg_tick = now
             update_door_open_state()
