@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# install.sh — Room Monitor installer (interactive)
+# install.sh — Room Monitor installer (interactive) + optional Kiosk
 # Run: sudo ./install.sh
 #
 # Full install does:
@@ -11,6 +11,7 @@ set -euo pipefail
 #  - writes config: /etc/room_monitor/config.env (0600)
 #  - installs script: /usr/local/bin/Room_Monitor.py
 #  - optional systemd service: room_monitor.service
+#  - optional Chromium kiosk autostart (safe for X11 + Wayland)
 # ============================================================
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -36,6 +37,11 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 DEFAULT_MQTT_PORT="1883"
 DEFAULT_HA_PORT="8123"
 DEFAULT_DISCOVERY_PREFIX="homeassistant"
+
+# Kiosk bits
+DEFAULT_KIOSK_USER="${SUDO_USER:-pi}"
+KIOSK_WRAPPER="/usr/local/bin/room_monitor_kiosk.sh"
+KIOSK_DESKTOP_NAME="room_monitor_kiosk.desktop"
 
 # ------------------------
 # Helpers (robust + clear)
@@ -161,7 +167,7 @@ prompt_secret () {
   fi
 
   read -r -s -p "> " var
-  >&2 echo   # <-- IMPORTANT: stderr, not stdout
+  >&2 echo   # IMPORTANT: stderr, not stdout
 
   sanitize "${var}"
 }
@@ -300,6 +306,138 @@ echo "==> Validating config file format"
 validate_env_file "${CONF_FILE}"
 
 # ============================================================
+# 2b) Optional Kiosk setup (Pi OS Desktop; safe for X11 + Wayland)
+# ============================================================
+DO_KIOSK="$(prompt_yes_no "Install Chromium Kiosk that auto-opens Home Assistant on boot?" "n")"
+KIOSK_USER="${DEFAULT_KIOSK_USER}"
+
+if [[ "${DO_KIOSK}" == "y" ]]; then
+  KIOSK_HOME="$(getent passwd "${KIOSK_USER}" | cut -d: -f6 || true)"
+  if [[ -z "${KIOSK_HOME}" ]]; then
+    echo "ERROR: could not determine home for kiosk user: ${KIOSK_USER}"
+    exit 1
+  fi
+
+  if [[ "${FULL_INSTALL}" != "y" ]]; then
+    echo "==> Kiosk install selected in reconfigure-only mode."
+    echo "==> Installing kiosk packages anyway (Chromium + helpers)."
+  fi
+
+  echo "==> Installing kiosk packages"
+  apt-get update
+
+  # Chromium package name varies by Pi OS release; try both.
+  if ! apt-get install -y chromium-browser >/dev/null 2>&1; then
+    apt-get install -y chromium || true
+  fi
+
+  # Optional helpers (safe if already installed / unavailable)
+  apt-get install -y unclutter xdotool x11-xserver-utils >/dev/null 2>&1 || true
+
+  echo "==> Writing kiosk launcher: ${KIOSK_WRAPPER}"
+  cat > "${KIOSK_WRAPPER}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_FILE="/etc/room_monitor/config.env"
+if [[ -f "${CONF_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${CONF_FILE}"
+  set +a
+fi
+
+HA_HOST="${HA_HOST:-}"
+HA_PORT="${HA_PORT:-8123}"
+
+if [[ -n "${HA_HOST}" ]]; then
+  URL="http://${HA_HOST}:${HA_PORT}"
+else
+  URL="http://homeassistant.local:${HA_PORT}"
+fi
+
+# Pick Chromium binary (varies by distro)
+CHROME=""
+for c in chromium-browser chromium; do
+  if command -v "${c}" >/dev/null 2>&1; then
+    CHROME="$(command -v "${c}")"
+    break
+  fi
+done
+
+if [[ -z "${CHROME}" ]]; then
+  echo "ERROR: Chromium not found (chromium-browser/chromium)."
+  exit 1
+fi
+
+SESSION_TYPE="${XDG_SESSION_TYPE:-}"
+if [[ -z "${SESSION_TYPE}" ]]; then
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    SESSION_TYPE="wayland"
+  elif [[ -n "${DISPLAY:-}" ]]; then
+    SESSION_TYPE="x11"
+  else
+    SESSION_TYPE="unknown"
+  fi
+fi
+
+COMMON_ARGS=(
+  --kiosk
+  --noerrdialogs
+  --disable-infobars
+  --disable-session-crashed-bubble
+  --check-for-update-interval=31536000
+  --autoplay-policy=no-user-gesture-required
+  "${URL}"
+)
+
+# X11 niceties only when X11 is actually present
+if [[ "${SESSION_TYPE}" == "x11" ]]; then
+  if command -v xset >/dev/null 2>&1; then
+    xset s off || true
+    xset s noblank || true
+    xset -dpms || true
+  fi
+  if command -v unclutter >/dev/null 2>&1; then
+    unclutter -idle 0.2 -root & disown || true
+  fi
+
+  exec "${CHROME}" "${COMMON_ARGS[@]}"
+fi
+
+# Wayland: use Ozone/Wayland flags if possible (safe even if ignored)
+if [[ "${SESSION_TYPE}" == "wayland" ]]; then
+  exec "${CHROME}" \
+    --enable-features=UseOzonePlatform \
+    --ozone-platform=wayland \
+    "${COMMON_ARGS[@]}"
+fi
+
+# Fallback: try without display tweaks; Chromium may still work depending on environment
+exec "${CHROME}" "${COMMON_ARGS[@]}"
+EOF
+  chmod 0755 "${KIOSK_WRAPPER}"
+
+  echo "==> Enabling kiosk via autostart for user: ${KIOSK_USER}"
+  install -d -m 0755 "${KIOSK_HOME}/.config/autostart"
+  cat > "${KIOSK_HOME}/.config/autostart/${KIOSK_DESKTOP_NAME}" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Room Monitor Kiosk
+Exec=${KIOSK_WRAPPER}
+X-GNOME-Autostart-enabled=true
+EOF
+
+  chown -R "${KIOSK_USER}:${KIOSK_USER}" "${KIOSK_HOME}/.config/autostart"
+
+  echo "✅ Kiosk installed."
+  echo "   - Autostart: ${KIOSK_HOME}/.config/autostart/${KIOSK_DESKTOP_NAME}"
+  echo "   - Launcher:  ${KIOSK_WRAPPER}"
+  echo "   - URL:       http://\$HA_HOST:\$HA_PORT (from ${CONF_FILE})"
+  echo "   NOTE: Kiosk starts on next GUI login/boot for user: ${KIOSK_USER}"
+fi
+
+# ============================================================
 # 3) Log dir (always)
 # ============================================================
 echo "==> Ensuring log dir exists: ${LOG_DIR}"
@@ -381,6 +519,7 @@ echo "Discovery prefix:     ${HA_DISCOVERY_PREFIX}"
 echo "Installed script:     ${INSTALL_PATH} $([[ -f "${INSTALL_PATH}" ]] && echo "(present)" || echo "(missing)")"
 echo "Service file:         ${SERVICE_PATH} $([[ -f "${SERVICE_PATH}" ]] && echo "(present)" || echo "(missing)")"
 echo "Log dir:              ${LOG_DIR}"
+echo "Kiosk:                $([[ "${DO_KIOSK:-n}" == "y" ]] && echo "Enabled (autostart; user=${KIOSK_USER})" || echo "Not installed")"
 echo "================================================="
 echo
 
@@ -393,6 +532,14 @@ if [[ "${DO_SERVICE}" == "y" ]]; then
 else
   echo "To enable service later, re-run:"
   echo "  sudo ./install.sh"
+fi
+
+if [[ "${DO_KIOSK:-n}" == "y" ]]; then
+  echo
+  echo "Kiosk notes:"
+  echo " - Starts on next GUI login/boot for user: ${KIOSK_USER}"
+  echo " - Uses Wayland-safe flags when Wayland is detected."
+  echo " - Uses X11 power/blanking tweaks only when X11 is detected."
 fi
 
 echo
